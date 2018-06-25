@@ -1,0 +1,203 @@
+
+USE [msdb]
+GO
+
+/****** Object:  StoredProcedure [dbo].[BackupDatabase] ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+/*
+@dbName - Имя базы
+@dir - путь к файлу бэкапов
+@backupType:
+	0 - Автоматический режим (на первым в месяце делается полный бэкап, а потом разностный)
+	1 - Бэкап журнала транзакций
+	2 - Полный бэкап (принудительно)
+	3 - Разностный бэкап (принудительно)
+@retainDays - количество дней хранения бэкапов, 0 - бессрочно	
+@fullDateSuffixForDiffBackup - складывать дифференциальные бэкапы в отдельный файл (по одному в день), если = 0, то складывается в один файл
+@isDemoMode - демо режим, сам бэкап не делается, но выводится команда SQL, которая должна выполниться в обычном режиме
+*/
+CREATE PROCEDURE [dbo].[BackupDatabase](@dbName varchar(256), @dir varchar(1000), @backupType tinyint = 0, @retainDays int = 31 ,@fullDateSuffixForDiffBackup tinyint = 1, @isDemoMode tinyint = 0) AS
+
+BEGIN
+
+	declare @dateLastFullBackup datetime;		--дата последнего полного бэкапа
+	declare @dateLastDiffBackup datetime;		--дата последнего разностного бэкапа
+	declare @fileLastFullBackup varchar(200)	--имя файла последнего полного бэкапа 
+	declare @backupDate datetime				--текущая дата
+	declare @dateSuffix varchar(200)			-- Суффикс к бэкапу в виде даты	
+	declare @path varchar(1000)					-- Польный путь для бэкапа
+	declare @comment nvarchar(100)				-- Комментарий к бэкапу
+	declare @folder nvarchar(100)				-- Папка сохранения бэкапа
+	declare @retainDaysSuffix nvarchar(100)		-- Время хранения бэкапа в днях
+	declare @cmd nvarchar(1000)					-- Команда бэкапа
+	declare @recoveryModel tinyint;				-- модель восстановления базы
+	declare @recoveryModelDesc varchar(200);
+	
+	SET @backupDate = GetDate()					--получаем текущую дату
+	
+	SET @dateSuffix = LEFT(REPLACE(CONVERT(char(10), @backupDate, 120), '-', '_'), 10) -- в формате гггг_мм
+	
+	IF @retainDays > 0 -- определим параметр времени хранения бэкапа
+		BEGIN
+			SET @retainDaysSuffix = N', RETAINDAYS = ' + CAST(@retainDays AS nvarchar)
+		END
+	ELSE 
+		BEGIN
+			SET @retainDaysSuffix = N'' 
+		END
+		
+	--Добавим слеш, если его нет
+	IF RIGHT(@folder, 1) <> N'\' 
+	BEGIN
+		SET @folder = @folder + '\'
+	END
+	
+	SET @folder = @dir + @dbName;
+	
+	EXECUTE master.dbo.xp_create_subdir  @folder -- Создадим папку, если такой еще нет
+	
+	--проверим есть ли полный бэкап в этом месяце
+	SELECT TOP 1 
+		  @dateLastFullBackup = [bs].[backup_finish_date],
+		  @fileLastFullBackup = REVERSE(LEFT(REVERSE([bmf].[physical_device_name]), CHARINDEX('\',REVERSE([bmf].[physical_device_name]))-1))
+	FROM [msdb].[dbo].[backupset] AS bs
+	LEFT JOIN [msdb].[dbo].[backupmediafamily] AS bmf ON bs.media_set_id = bmf.media_set_id
+	WHERE database_name = @dbName
+	  --and type = 'I' --Differential database
+		and type = 'D' --Database
+	  --and type = 'L' --Log
+		and is_copy_only = 0
+		
+	ORDER BY backup_finish_date DESC;
+	--Получим дату последнего разностного бэкапа
+	SELECT TOP 1 
+		  @dateLastDiffBackup = [bs].[backup_finish_date]
+	FROM [msdb].[dbo].[backupset] AS bs
+	WHERE database_name = @dbName
+	  and type = 'I' --Differential database
+	  --and type = 'D' --Database
+	  --and type = 'L' --Log
+		and is_copy_only = 0
+		
+	ORDER BY backup_finish_date DESC;	
+	
+	IF @backupType = 1 --Бэкап журнала транзакций
+		BEGIN
+			
+			SELECT @recoveryModel = recovery_model, @recoveryModelDesc = recovery_model_desc FROM sys.databases WHERE name = @dbName;
+			
+			IF @recoveryModel = 1 --Модель восстановления FULL, только в этом случае можем делать бэкап журнала транзакций
+				BEGIN
+					IF @fileLastFullBackup IS NULL 
+						BEGIN 
+							SET @path		= @folder + '\' + @dbName + '_log_' + @dateSuffix  + '.trn'
+						END
+					ELSE -- если был полный бэкап, то делаем файл с таким же именем
+						BEGIN
+							SET @path = @folder + '\' + REPLACE(REPLACE(@fileLastFullBackup, '_full_', '_log_'), '.bak','.trn')
+						END
+					
+					SET @comment	= @dbName + N' - Бэкап журнала транзакций'
+					SET @cmd = N'BACKUP LOG [' + @dbName + '] TO  DISK = N''' + @path + ''' WITH NOFORMAT, NOINIT ' + @retainDaysSuffix + ', NAME = N''' + @comment + ''' , SKIP, NOREWIND, NOUNLOAD, STATS = 10'
+				END
+			ELSE
+				BEGIN
+					SELECT N'База ' + @dbName + N' имеет модель восстановления ' + @recoveryModelDesc + N'. Бэкап журнала  транзакций возможен только в режиме FULL'  AS [Error 1:]
+					RETURN
+				END
+				
+		END
+	ELSE
+		BEGIN
+			IF @backupType = 2 OR (
+									@backupType = 0 
+									AND (DATEADD(MONTH,DATEDIFF(MONTH,0,@backupDate),0) != DATEADD(MONTH,DATEDIFF(MONTH,0,@dateLastFullBackup),0) 
+											-- MONTH(@backupDate) != MONTH(@dateLastFullBackup) 
+											OR @dateLastFullBackup is null) --если полный бэкап в этом месяце не создавался
+										)		
+				BEGIN				--полный бэкап
+
+					SET @path		= @folder + '\' + @dbName + '_full_' + @dateSuffix + '.bak'
+					SET @comment	= @dbName + N' - Полный бэкап'
+										
+					SET @cmd = N'BACKUP DATABASE ['+  @dbName + '] TO  DISK = N''' +  @path + ''' WITH NOFORMAT, NOINIT ' + @retainDaysSuffix + ', NAME = N''' + @comment + ''' , SKIP, NOREWIND, NOUNLOAD, STATS = 10, CHECKSUM'
+				
+				END
+			ELSE 
+				BEGIN --принудительно указали разностный или раз в день в автоматическом режиме
+					IF @backupType = 3 OR (
+									@backupType = 0
+									AND (DATEADD(DAY,DATEDIFF(DAY,0,@backupDate),0) != DATEADD(DAY,DATEDIFF(DAY,0,@dateLastDiffBackup),0) 
+											OR @dateLastDiffBackup is null) --если разностный бэкап сегодня не создавался
+										)		
+				
+						BEGIN				--разностный бэкап
+							IF @fullDateSuffixForDiffBackup = 0 -- Если в один файл, то сократим префикс до ГГГГ_ММ
+								BEGIN
+									SET @dateSuffix = LEFT(@dateSuffix, 7)
+								END
+							--добавим к крефиксу дату полного бэкапа в формате _fггггммдд_, где f признак полного бэкапа
+							IF @dateLastFullBackup IS NOT NULL AND @fullDateSuffixForDiffBackup <> 0
+								BEGIN
+									SET @dateSuffix = N'f'+CONVERT(NVARCHAR(10), @dateLastFullBackup, 112)+N'_' +@dateSuffix
+								END
+													
+								
+							IF @fileLastFullBackup IS NOT NULL AND @fullDateSuffixForDiffBackup = 0 -- Если в один файл и был полный бэкап, то возмем имя полного бэкапа
+								BEGIN
+									SET @path = @folder + '\' + REPLACE(@fileLastFullBackup, '_full_', '_diff_')
+								END
+							ELSE 
+								BEGIN 
+									SET @path		= @folder + '\' + @dbName + N'_diff_' + @dateSuffix  + N'.bak'
+								END
+
+							SET @comment	= @dbName + N' - Разностный бэкап'
+							SET @cmd = N'BACKUP DATABASE [' +  @dbName + '] TO  DISK = N''' +  @path + ''' WITH  DIFFERENTIAL , NOFORMAT, NOINIT ' + @retainDaysSuffix + ',  NAME = N''' +  @comment + ''' , SKIP, NOREWIND, NOUNLOAD,  STATS = 10, CHECKSUM'
+						END
+					ELSE 
+						BEGIN
+							IF @backupType = 0 
+								BEGIN
+								 
+									SELECT N'Разностный бэкап уже создавался в ' + CONVERT (NVARCHAR(100), @dateLastDiffBackup,121) AS [Error 2:]
+								END
+							ELSE 
+								BEGIN
+									SELECT N'Неверный тип параметра @backupType. 
+Допустимы:
+	0 - Автоматический режим (на первым в месяце делается полный бэкап, а потом разностный)
+	1 - Бэкап журнала транзакций
+	2 - Полный бэкап (принудительно)
+	3 - Разностный бэкап (принудительно)' AS [Error 3:]
+								END
+							RETURN
+						END
+				END
+						
+		END	
+		
+		BEGIN TRY
+			IF @isDemoMode = 0 
+				BEGIN
+					exec sp_executesql @cmd
+				END
+			ELSE
+				BEGIN
+					SELECT @cmd AS [Будет выполена команда:]
+				END			
+		END TRY
+		BEGIN CATCH
+			BEGIN
+				SELECT @cmd AS cmd, ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+			END
+		END CATCH
+					
+END
+GO

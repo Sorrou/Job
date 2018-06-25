@@ -1,0 +1,1 @@
+sqlcmd -S localhost\SQLEXPRESS -i C:\Script1.sql

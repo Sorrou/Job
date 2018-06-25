@@ -1,0 +1,3 @@
+ForFiles /P D:\ArchLTS\BackUp\Month\ /S /M *.* /D -31 /C "cmd /c DEL /q /f @file" 
+:repeat 
+for /f "tokens=*" %%i in (' dir /b /s /ad "D:\ArchLTS\BackUp\Month\" ') do 2>nul rd /q "%%i" && goto:repeat
