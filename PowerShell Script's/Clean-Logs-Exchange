@@ -1,3 +1,13 @@
+#Отправка в телегу
+Function CurlPost {
+    E:\Defrag\curl.exe -s --socks5-hostname proxy.mamsycorp.ru:80 -U mamsy:socks#2018 -X POST `
+    "https://api.telegram.org/bot239455971:AAFLDv-b9qRvdPL7vYhiSKQFxwinc4OWOS0/sendMessage?chat_id=-282324185&text=$args"
+    }
+
+#сколько свободного место До:
+$space = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3" -Computer localhost  | `
+Select DeviceID,@{Name="size(GB)";Expression={"{0:N1}" -f($_.size/1gb)}},@{Name="freespace(GB)";Expression={"{0:N1}" -f($_.freespace/1gb)}} 
+foreach($line in $space) {if ($line.DeviceID -eq "C:") {$space_before = $line.'freespace(GB)'}}
 
 $days=10
 $IISLogPath="C:\inetpub\logs\LogFiles\"
@@ -12,7 +22,7 @@ Function CleanLogfiles($TargetFolder)
         $Now = Get-Date
         $LastWrite = $Now.AddDays(-$days)
     #   $Files = Get-ChildItem $TargetFolder -Include *.log,*.blg, *.etl -Recurse | Where {$_.LastWriteTime -le "$LastWrite"}
-        $Files = Get-ChildItem "C:\Program Files\Microsoft\Exchange Server\V15\Logging\"  -Recurse | Where-Object {$_.Name -like "*.log" -or $_.Name -like "*.blg" -or $_.Name -like "*.etl"}  | where {$_.lastWriteTime -le "$lastwrite"} | Select-Object FullName  
+        $Files = Get-ChildItem $TargetFolder -Recurse | Where-Object {$_.Name -like "*.log" -or $_.Name -like "*.blg" -or $_.Name -like "*.etl"}  | where {$_.lastWriteTime -le "$lastwrite"} | Select-Object FullName  
         foreach ($File in $Files)
             {
                $FullFileName = $File.FullName  
@@ -28,3 +38,9 @@ CleanLogfiles($IISLogPath)
 CleanLogfiles($ExchangeLoggingPath)
 CleanLogfiles($ETLLoggingPath)
 CleanLogfiles($ETLLoggingPath2)
+
+#Сколько места мы освободили
+foreach($line in $space) {if ($line.DeviceID -eq "C:") {$space_after = $line.'freespace(GB)'}}
+$spaceDiff = $space_after - $space_before
+
+CurlPost 'Logs cleared on EXCH02, erased' + $spaceDiff + 'Gb'
