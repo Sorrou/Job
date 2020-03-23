@@ -3,9 +3,7 @@ import datetime
 from flask import Flask
 
 
-t = {'name': 'JSON time'}
-
-t['date'] = datetime.datetime.now()
+t = {'date' : datetime.datetime.now() }
 
 def strconverter(o):
     if isinstance(o, datetime.datetime):
